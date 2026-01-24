@@ -1,0 +1,81 @@
+
+---
+
+## .gitignore
+
+```gitignore
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.eggs/
+*.log
+
+# ===== Virtualenv =====
+.venv/
+venv/
+ENV/
+env/
+
+# ===== PyCharm / IntelliJ =====
+.idea/
+*.iml
+
+# ===== VS Code =====
+.vscode/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== OS / Windows =====
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ===== Mac =====
+.DS_Store
+
+# ===== Local configs / secrets =====
+.env
+.env.*
+*.key
+*.pem
+*.p12
+
+# ===== Local data/output =====
+*.txt
+*.csv
+*.tsv
+*.jsonl
+*.parquet
+*.sqlite
+*.db
+
+# If you want to keep sample outputs, whitelist them:
+# !sample/*.txt
+
+# ===== Large archives / pdf =====
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.pdf
+
+# ===== pytest / coverage =====
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===== my local folders (optional) =====
+SuperCon/
+downloads/
+output/
+data/
