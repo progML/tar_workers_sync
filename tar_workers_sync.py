@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import io
 import logging
@@ -14,14 +15,16 @@ import boto3
 from botocore.config import Config
 import psycopg2
 
-
 # -------------------------
-# ID normalization (нужно только для имени файла в Timeweb)
+# ID normalization
+# - for matching lookup inside tar
+# - for destination key naming
 # -------------------------
 
 ID_VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
 
-def strip_arxiv_prefix_and_version(raw: str) -> str:
+def normalize_lookup(raw: str) -> str:
+    """Normalize lookup key to match filenames inside tar (usually without arXiv: and without vN)."""
     s = (raw or "").strip()
     if not s:
         return ""
@@ -30,6 +33,9 @@ def strip_arxiv_prefix_and_version(raw: str) -> str:
     s = ID_VERSION_RE.sub("", s)
     return s
 
+def dst_key_for_arxiv_id(dst_prefix: str, arxiv_id: str) -> str:
+    safe = normalize_lookup(arxiv_id).replace("/", "_")
+    return f"{dst_prefix}{safe}.pdf"
 
 # -------------------------
 # Logging
@@ -40,7 +46,6 @@ def setup_logging(level: str = "INFO"):
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
-
 
 # -------------------------
 # DB SQL
@@ -58,7 +63,6 @@ where status='DOWNLOADING'
   and coalesce(heartbeat_at, locked_at, updated_at) < (now() - (%s || ' minutes')::interval);
 """
 
-# Забираем задачи: возвращаем (arxiv_id, lookup_key)
 SQL_CLAIM_AND_MARK = """
 with cte as (
     select arxiv_id, lookup_key
@@ -93,14 +97,15 @@ where arxiv_id = any(%s::text[])
   and locked_by=%s;
 """
 
-# Ищем tar по lookup_key (в pdf_tar_index оно хранится как arxiv_id)
 SQL_FIND_TAR_FOR_LOOKUP_IDS = """
 select idx.tar_key, idx.arxiv_id
 from pdf_tar_index idx
 where idx.arxiv_id = any(%s::text[]);
 """
 
-SQL_MARK_ONE_DONE = """
+# --- Batch status updates (avoid per-id connections) ---
+
+SQL_MARK_DONE_BATCH = """
 update arxiv_paper
 set status='DONE',
     locked_by=null,
@@ -108,7 +113,7 @@ set status='DONE',
     heartbeat_at=null,
     updated_at=now(),
     last_error=null
-where arxiv_id=%s;
+where arxiv_id = any(%s::text[]);
 """
 
 SQL_MARK_NOT_FOUND = """
@@ -133,7 +138,6 @@ set status='ERROR',
 where arxiv_id = any(%s::text[]);
 """
 
-
 # -------------------------
 # S3 config
 # -------------------------
@@ -143,8 +147,7 @@ class S3SrcConfig:
     bucket: str
     region: str
     request_payer: Optional[str] = None
-    profile: Optional[str] = None   # aws profile
-
+    profile: Optional[str] = None   # optional (local only)
 
 @dataclass(frozen=True)
 class S3DstConfig:
@@ -152,45 +155,48 @@ class S3DstConfig:
     endpoint_url: str               # timeweb endpoint
     prefix: str = "pdf/"
     region: Optional[str] = None
-    profile: Optional[str] = None
+    profile: Optional[str] = None   # optional (local only)
     addressing_style: str = "path"
 
+    access_key_id: Optional[str] = None
+    secret_access_key: Optional[str] = None
+    session_token: Optional[str] = None
+
+def _boto_session(profile: Optional[str]):
+    return boto3.Session(profile_name=profile) if profile else boto3.Session()
 
 def make_s3_client_src(cfg: S3SrcConfig):
-    sess = boto3.Session(profile_name=cfg.profile) if cfg.profile else boto3.Session()
+    sess = _boto_session(cfg.profile)
     return sess.client(
         "s3",
         region_name=cfg.region,
         config=Config(
             retries={"max_attempts": 10, "mode": "standard"},
-            max_pool_connections=50,
+            max_pool_connections=100,   # increased since we reuse client across threads
         ),
     )
-
 
 def make_s3_client_dst(cfg: S3DstConfig):
-    sess = boto3.Session(profile_name=cfg.profile) if cfg.profile else boto3.Session()
-    return sess.client(
-        "s3",
-        endpoint_url=cfg.endpoint_url,
-        region_name=cfg.region,
-        config=Config(
+    sess = _boto_session(cfg.profile)
+    kwargs = {
+        "endpoint_url": cfg.endpoint_url,
+        "region_name": cfg.region,
+        "config": Config(
             s3={"addressing_style": cfg.addressing_style},
             retries={"max_attempts": 10, "mode": "standard"},
-            max_pool_connections=50,
+            max_pool_connections=100,
         ),
-    )
-
+    }
+    if cfg.access_key_id and cfg.secret_access_key:
+        kwargs["aws_access_key_id"] = cfg.access_key_id
+        kwargs["aws_secret_access_key"] = cfg.secret_access_key
+        if cfg.session_token:
+            kwargs["aws_session_token"] = cfg.session_token
+    return sess.client("s3", **kwargs)
 
 # -------------------------
 # Upload helpers
 # -------------------------
-
-def _dst_key_for_arxiv_id(dst_prefix: str, arxiv_id: str) -> str:
-    # в файле заменим "/" чтобы не создавать pseudo-folders
-    safe = strip_arxiv_prefix_and_version(arxiv_id).replace("/", "_")
-    return f"{dst_prefix}{safe}.pdf"
-
 
 def put_stream_multipart(
     s3,
@@ -241,7 +247,6 @@ def put_stream_multipart(
             pass
         raise
 
-
 # -------------------------
 # DB helpers
 # -------------------------
@@ -253,17 +258,12 @@ def heartbeat(conn, arxiv_ids: List[str], worker_id: str):
         cur.execute(SQL_HEARTBEAT, (arxiv_ids, worker_id))
     conn.commit()
 
-
-def mark_one_done(pg_dsn: str, arxiv_id: str):
-    # отдельный короткий транзакционный апдейт: DONE сразу после upload
-    c = psycopg2.connect(pg_dsn)
-    try:
-        with c.cursor() as cur:
-            cur.execute(SQL_MARK_ONE_DONE, (arxiv_id,))
-        c.commit()
-    finally:
-        c.close()
-
+def mark_done_batch(conn, arxiv_ids: List[str]):
+    if not arxiv_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(SQL_MARK_DONE_BATCH, (arxiv_ids,))
+    conn.commit()
 
 # -------------------------
 # TAR processing
@@ -272,36 +272,33 @@ def mark_one_done(pg_dsn: str, arxiv_id: str):
 def stream_tar_and_upload(
     pg_dsn: str,
     worker_id: str,
+    s3_src,
+    s3_dst,
     src_cfg: S3SrcConfig,
     dst_cfg: S3DstConfig,
     tar_key: str,
-    wanted_lookup_keys: Set[str],
-    lookup_to_originals: Dict[str, List[str]],
+    wanted_lookup_keys_norm: Set[str],
+    lookup_norm_to_originals: Dict[str, List[str]],
     *,
     part_size: int,
     heartbeat_sec: int,
 ) -> Tuple[List[str], List[str], List[str], Optional[str]]:
     """
-    returns:
-      uploaded_original_ids,
-      not_found_original_ids,
-      all_original_ids_in_job,
-      error_string
+    Returns:
+      uploaded_ids, not_found_ids, job_ids, error
     """
-    s3_src = make_s3_client_src(src_cfg)
-    s3_dst = make_s3_client_dst(dst_cfg)
 
     uploaded: List[str] = []
     found_lookup: Set[str] = set()
 
-    all_original_ids: List[str] = []
-    for ids in lookup_to_originals.values():
-        all_original_ids.extend(ids)
+    job_ids: List[str] = []
+    for ids in lookup_norm_to_originals.values():
+        job_ids.extend(ids)
 
     # initial heartbeat best-effort
     try:
         hb = psycopg2.connect(pg_dsn)
-        heartbeat(hb, all_original_ids, worker_id)
+        heartbeat(hb, job_ids, worker_id)
         hb.close()
     except Exception:
         pass
@@ -317,14 +314,13 @@ def stream_tar_and_upload(
 
         resp = s3_src.get_object(**get_kwargs)
         body = resp["Body"]
-
         tf = tarfile.open(fileobj=body, mode="r|*")
 
         for member in tf:
             if heartbeat_sec > 0 and (time.time() - last_hb) >= heartbeat_sec:
                 try:
                     hb = psycopg2.connect(pg_dsn)
-                    heartbeat(hb, all_original_ids, worker_id)
+                    heartbeat(hb, job_ids, worker_id)
                     hb.close()
                 except Exception:
                     pass
@@ -334,16 +330,17 @@ def stream_tar_and_upload(
                 continue
 
             base = os.path.basename(member.name)
-            lookup = base[:-4]  # remove .pdf
+            lookup_in_tar = base[:-4]  # without .pdf
+            lookup_norm = normalize_lookup(lookup_in_tar)
 
-            if lookup not in wanted_lookup_keys:
+            if lookup_norm not in wanted_lookup_keys_norm:
                 continue
 
             f = tf.extractfile(member)
             if f is None:
                 continue
 
-            originals = lookup_to_originals.get(lookup, [])
+            originals = lookup_norm_to_originals.get(lookup_norm, [])
             if not originals:
                 try:
                     f.close()
@@ -354,21 +351,14 @@ def stream_tar_and_upload(
             # upload
             if len(originals) == 1:
                 original_id = originals[0]
-                dst_key = _dst_key_for_arxiv_id(dst_cfg.prefix, original_id)
+                dst_key = dst_key_for_arxiv_id(dst_cfg.prefix, original_id)
                 put_stream_multipart(s3_dst, dst_cfg.bucket, dst_key, f, part_size=part_size)
-
-                # ✅ СРАЗУ ставим DONE
-                mark_one_done(pg_dsn, original_id)
                 uploaded.append(original_id)
-
             else:
                 data = f.read()
                 for original_id in originals:
-                    dst_key = _dst_key_for_arxiv_id(dst_cfg.prefix, original_id)
+                    dst_key = dst_key_for_arxiv_id(dst_cfg.prefix, original_id)
                     put_stream_multipart(s3_dst, dst_cfg.bucket, dst_key, io.BytesIO(data), part_size=part_size)
-
-                    # ✅ СРАЗУ DONE
-                    mark_one_done(pg_dsn, original_id)
                     uploaded.append(original_id)
 
             try:
@@ -376,19 +366,17 @@ def stream_tar_and_upload(
             except Exception:
                 pass
 
-            found_lookup.add(lookup)
+            found_lookup.add(lookup_norm)
 
-        # что не нашли внутри tar
-        not_found_lookup = wanted_lookup_keys - found_lookup
-        not_found_original: List[str] = []
+        not_found_lookup = wanted_lookup_keys_norm - found_lookup
+        not_found_ids: List[str] = []
         for lk in not_found_lookup:
-            not_found_original.extend(lookup_to_originals.get(lk, []))
+            not_found_ids.extend(lookup_norm_to_originals.get(lk, []))
 
-        return uploaded, not_found_original, all_original_ids, None
+        return uploaded, not_found_ids, job_ids, None
 
     except Exception as e:
-        # ✅ НЕ теряем uploaded (частичный прогресс)
-        return uploaded, [], all_original_ids, f"{type(e).__name__}: {e}"
+        return uploaded, [], job_ids, f"{type(e).__name__}: {e}"
 
     finally:
         try:
@@ -402,56 +390,60 @@ def stream_tar_and_upload(
         except Exception:
             pass
 
-
 # -------------------------
 # Plan + run
 # -------------------------
 
-def build_plan_from_db(
-    conn,
-    limit_rows: int,
-    max_attempts: int,
-    worker_id: str
-) -> Tuple[Dict[str, Dict[str, List[str]]], List[str]]:
+def build_plan_from_db(conn, limit_rows: int, max_attempts: int, worker_id: str):
     """
-    returns:
-      tar_key -> { lookup_key -> [original_arxiv_id, ...] }
-      no_tar_original_ids
+    Returns:
+      tar_plan: tar_key -> (wanted_lookup_norm_set, lookup_norm_to_originals)
+      no_tar_original_ids: [arxiv_id,...]
     """
-    tar_to_lookup_to_originals: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+    tar_to_lookup_norm_to_originals: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
     no_tar: List[str] = []
 
     with conn.cursor() as cur:
         cur.execute(SQL_CLAIM_AND_MARK, (max_attempts, limit_rows, worker_id))
-        claimed_rows = cur.fetchall()  # [(arxiv_id, lookup_key)]
+        claimed_rows = cur.fetchall()
         conn.commit()
 
     if not claimed_rows:
         return {}, []
 
-    # lookup keys we need to resolve in pdf_tar_index
-    lookup_list = [lk for _, lk in claimed_rows if lk]
-    lookup_list = [x.strip() for x in lookup_list if x.strip()]
-
-    with conn.cursor() as cur:
-        cur.execute(SQL_FIND_TAR_FOR_LOOKUP_IDS, (lookup_list,))
-        mappings = cur.fetchall()  # (tar_key, lookup_key)
-
-    lookup_to_tar: Dict[str, str] = {}
-    for tar_key, lookup_key in mappings:
-        if tar_key and lookup_key and lookup_key not in lookup_to_tar:
-            lookup_to_tar[lookup_key] = tar_key
-
+    # normalize lookup keys for matching inside tar
+    lookup_norm_list: List[str] = []
+    original_to_lookup_norm: List[Tuple[str, str]] = []
     for original_id, lk in claimed_rows:
-        lk = (lk or "").strip()
-        tar = lookup_to_tar.get(lk)
+        lk_norm = normalize_lookup(lk)
+        if lk_norm:
+            lookup_norm_list.append(lk_norm)
+            original_to_lookup_norm.append((original_id, lk_norm))
+
+    # find tar for LOOKUP KEYS (in your index they are stored in idx.arxiv_id)
+    with conn.cursor() as cur:
+        cur.execute(SQL_FIND_TAR_FOR_LOOKUP_IDS, (lookup_norm_list,))
+        mappings = cur.fetchall()
+
+    lookup_norm_to_tar: Dict[str, str] = {}
+    for tar_key, lookup_key in mappings:
+        lk_norm = normalize_lookup(lookup_key)
+        if tar_key and lk_norm and lk_norm not in lookup_norm_to_tar:
+            lookup_norm_to_tar[lk_norm] = tar_key
+
+    for original_id, lk_norm in original_to_lookup_norm:
+        tar = lookup_norm_to_tar.get(lk_norm)
         if tar:
-            tar_to_lookup_to_originals[tar][lk].append(original_id)
+            tar_to_lookup_norm_to_originals[tar][lk_norm].append(original_id)
         else:
             no_tar.append(original_id)
 
-    return tar_to_lookup_to_originals, no_tar
+    # build final tar_plan shape
+    tar_plan: Dict[str, Tuple[Set[str], Dict[str, List[str]]]] = {}
+    for tar_key, lk_map in tar_to_lookup_norm_to_originals.items():
+        tar_plan[tar_key] = (set(lk_map.keys()), lk_map)
 
+    return tar_plan, no_tar
 
 def run_once(
     pg_dsn: str,
@@ -469,6 +461,11 @@ def run_once(
 ):
     conn = psycopg2.connect(pg_dsn)
     conn.autocommit = False
+
+    # create S3 clients ONCE per process and reuse across threads
+    s3_src = make_s3_client_src(src_cfg)
+    s3_dst = make_s3_client_dst(dst_cfg)
+
     try:
         if stale_minutes > 0:
             with conn.cursor() as cur:
@@ -476,12 +473,9 @@ def run_once(
             conn.commit()
 
         tar_plan, no_tar = build_plan_from_db(conn, limit_rows=limit_rows, max_attempts=max_attempts, worker_id=worker_id)
-        claimed_total = sum(len(ids) for t in tar_plan.values() for ids in t.values()) + len(no_tar)
+        claimed_total = sum(len(ids) for wanted, lkmap in tar_plan.values() for ids in lkmap.values()) + len(no_tar)
 
-        logging.info(
-            "Plan built. claimed=%d tars=%d not_found_no_tar=%d",
-            claimed_total, len(tar_plan), len(no_tar)
-        )
+        logging.info("Plan built. claimed=%d tars=%d not_found_no_tar=%d", claimed_total, len(tar_plan), len(no_tar))
 
         if no_tar:
             with conn.cursor() as cur:
@@ -495,18 +489,18 @@ def run_once(
 
         futures = []
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            for tar_key, lookup_to_originals in tar_plan.items():
-                wanted_lookup = set(lookup_to_originals.keys())
-
+            for tar_key, (wanted_lookup_norm, lookup_norm_to_originals) in tar_plan.items():
                 futures.append(ex.submit(
                     stream_tar_and_upload,
                     pg_dsn,
                     worker_id,
+                    s3_src,
+                    s3_dst,
                     src_cfg,
                     dst_cfg,
                     tar_key,
-                    wanted_lookup,
-                    lookup_to_originals,
+                    wanted_lookup_norm,
+                    lookup_norm_to_originals,
                     part_size=part_size,
                     heartbeat_sec=heartbeat_sec,
                 ))
@@ -515,69 +509,83 @@ def run_once(
             total_not_found_in_tar = 0
             total_error_ids = 0
 
+            # Collect results and apply DB updates in batches (single connection)
+            uploaded_all: List[str] = []
+            not_found_all: List[str] = []
+            error_updates: List[Tuple[str, List[str]]] = []
+
             for fut in as_completed(futures):
                 uploaded_ids, not_found_ids, job_ids, error = fut.result()
 
-                # DONE уже ставим внутри job, здесь просто считаем
-                if uploaded_ids:
-                    total_uploaded += len(uploaded_ids)
+                total_uploaded += len(uploaded_ids)
+                uploaded_all.extend(uploaded_ids)
 
                 if not_found_ids:
                     total_not_found_in_tar += len(not_found_ids)
-                    with conn.cursor() as cur:
-                        cur.execute(SQL_MARK_NOT_FOUND, ("not found inside tar", not_found_ids))
-                    conn.commit()
+                    not_found_all.extend(not_found_ids)
 
                 if error:
-                    # ✅ ERROR только тем, кто НЕ попал в uploaded/not_found
                     uploaded_set = set(uploaded_ids)
                     nf_set = set(not_found_ids)
                     remaining_error = [x for x in job_ids if x not in uploaded_set and x not in nf_set]
-
                     if remaining_error:
                         total_error_ids += len(remaining_error)
-                        with conn.cursor() as cur:
-                            cur.execute(SQL_MARK_ERROR, (error, remaining_error))
-                        conn.commit()
-
+                        error_updates.append((error, remaining_error))
                     logging.error(
                         "TAR job error: %s (job=%d uploaded=%d not_found=%d error=%d)",
                         error, len(job_ids), len(uploaded_ids), len(not_found_ids), len(remaining_error)
                     )
 
-        logging.info(
-            "RUN DONE. tars=%d uploaded=%d not_found_in_tar=%d error_ids=%d",
-            len(tar_plan), total_uploaded, total_not_found_in_tar, total_error_ids
-        )
+            # Apply DB updates (batched)
+            if uploaded_all:
+                mark_done_batch(conn, uploaded_all)
+
+            if not_found_all:
+                with conn.cursor() as cur:
+                    cur.execute(SQL_MARK_NOT_FOUND, ("not found inside tar", not_found_all))
+                conn.commit()
+
+            for err_msg, ids in error_updates:
+                with conn.cursor() as cur:
+                    cur.execute(SQL_MARK_ERROR, (err_msg, ids))
+                conn.commit()
+
+        logging.info("RUN DONE. tars=%d uploaded=%d not_found_in_tar=%d error_ids=%d",
+                     len(tar_plan), total_uploaded, total_not_found_in_tar, total_error_ids)
 
     finally:
         conn.close()
-
 
 def run_loop(*args, interval_sec: int, **kwargs):
     while True:
         run_once(*args, **kwargs)
         time.sleep(interval_sec)
 
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 def main():
     ap = argparse.ArgumentParser(description="Stream arXiv tar -> upload PDFs to Timeweb S3, update arxiv_paper statuses")
-
     ap.add_argument("--pg", required=True, help="Postgres DSN")
 
     # source (arxiv)
     ap.add_argument("--src-bucket", default="arxiv")
     ap.add_argument("--src-region", default="us-east-1")
     ap.add_argument("--src-request-payer", default="requester")
-    ap.add_argument("--src-profile", default="default", help="AWS profile for SOURCE (arXiv)")
+    ap.add_argument("--src-profile", default="", help="Optional AWS profile for SOURCE (local only). Empty -> default chain")
 
     # destination (timeweb)
     ap.add_argument("--dst-bucket", required=True)
     ap.add_argument("--dst-endpoint", required=True)
     ap.add_argument("--dst-prefix", default="pdf/")
-    ap.add_argument("--dst-profile", default="timeweb", help="AWS profile for DEST (timeweb)")
     ap.add_argument("--dst-region", default="")
+    ap.add_argument("--dst-profile", default="", help="Optional profile for DEST (local only). Empty -> default chain")
     ap.add_argument("--dst-addressing-style", default="path", choices=["path", "virtual"])
+
+    # destination credentials (Timeweb) — лучше через ENV на EC2
+    ap.add_argument("--dst-access-key", default="", help="Timeweb access key (or env TIMEWEB_ACCESS_KEY_ID)")
+    ap.add_argument("--dst-secret-key", default="", help="Timeweb secret key (or env TIMEWEB_SECRET_ACCESS_KEY)")
+    ap.add_argument("--dst-session-token", default="", help="Optional session token")
 
     # runtime
     ap.add_argument("--concurrency", type=int, default=4, help="parallel tar jobs INSIDE one worker process")
@@ -599,8 +607,11 @@ def main():
     worker_id = f"{wid}:{os.getpid()}"
 
     setup_logging(args.log_level)
-
     part_size = max(8, args.part_size_mb) * 1024 * 1024
+
+    dst_access = args.dst_access_key or _env("TIMEWEB_ACCESS_KEY_ID")
+    dst_secret = args.dst_secret_key or _env("TIMEWEB_SECRET_ACCESS_KEY")
+    dst_token = args.dst_session_token or _env("TIMEWEB_SESSION_TOKEN")
 
     src_cfg = S3SrcConfig(
         bucket=args.src_bucket,
@@ -615,13 +626,14 @@ def main():
         region=args.dst_region or None,
         profile=args.dst_profile or None,
         addressing_style=args.dst_addressing_style,
+        access_key_id=dst_access or None,
+        secret_access_key=dst_secret or None,
+        session_token=dst_token or None,
     )
 
     if args.once:
         run_once(
-            args.pg,
-            src_cfg,
-            dst_cfg,
+            args.pg, src_cfg, dst_cfg,
             worker_id=worker_id,
             concurrency=args.concurrency,
             limit_rows=args.limit_rows,
@@ -633,9 +645,7 @@ def main():
         )
     else:
         run_loop(
-            args.pg,
-            src_cfg,
-            dst_cfg,
+            args.pg, src_cfg, dst_cfg,
             worker_id=worker_id,
             concurrency=args.concurrency,
             limit_rows=args.limit_rows,
@@ -646,7 +656,6 @@ def main():
             heartbeat_sec=args.heartbeat_sec,
             interval_sec=args.interval_sec,
         )
-
 
 if __name__ == "__main__":
     main()
