@@ -583,8 +583,8 @@ def main():
     ap.add_argument("--dst-addressing-style", default="path", choices=["path", "virtual"])
 
     # destination credentials (Timeweb) — лучше через ENV на EC2
-    ap.add_argument("--dst-access-key", default="", help="Timeweb access key (or env TIMEWEB_ACCESS_KEY_ID)")
-    ap.add_argument("--dst-secret-key", default="", help="Timeweb secret key (or env TIMEWEB_SECRET_ACCESS_KEY)")
+    ap.add_argument("--dst-access-key", default="", help="Timeweb access key (or env AWS_ACCESS_KEY_ID)")
+    ap.add_argument("--dst-secret-key", default="", help="Timeweb secret key (or env AWS_SECRET_ACCESS_KEY)")
     ap.add_argument("--dst-session-token", default="", help="Optional session token")
 
     # runtime
@@ -609,8 +609,8 @@ def main():
     setup_logging(args.log_level)
     part_size = max(8, args.part_size_mb) * 1024 * 1024
 
-    dst_access = args.dst_access_key or _env("TIMEWEB_ACCESS_KEY_ID")
-    dst_secret = args.dst_secret_key or _env("TIMEWEB_SECRET_ACCESS_KEY")
+    dst_access = args.dst_access_key or _env("AWS_ACCESS_KEY_ID")
+    dst_secret = args.dst_secret_key or _env("AWS_SECRET_ACCESS_KEY")
     dst_token = args.dst_session_token or _env("TIMEWEB_SESSION_TOKEN")
 
     src_cfg = S3SrcConfig(

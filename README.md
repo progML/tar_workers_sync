@@ -11,8 +11,8 @@
 
 ```bash
 
-$env:TIMEWEB_ACCESS_KEY_ID="..."
-$env:TIMEWEB_SECRET_ACCESS_KEY="..."
+$env:AWS_ACCESS_KEY_ID="..."
+$env:AWS_SECRET_ACCESS_KEY="..."
 
 .\.venv\Scripts\python.exe .\tar_workers_sync.py `
   --pg "postgresql://USER:PASS@DBHOST:5432/ragProm" `
